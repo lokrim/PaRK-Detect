@@ -1,35 +1,48 @@
 import os
 import cv2
 import numpy as np
+import math
 import rasterio
 from rasterio.windows import Window
-from rasterio.warp import transform
 import time
 import argparse
 from pathlib import Path
 
 # Configuration
-TIFF_DIR = "./TKM_Images"
-OUTPUT_DIR = "./crop_test_results"
+TIFF_DIR = "./TKM_IMAGES"
+OUTPUT_DIR = "./crop_results"
 os.makedirs(OUTPUT_DIR, exist_ok=True)
-
-# Test coordinates - add your own known coordinates here
-TEST_COORDINATES = [
-    {"lat": 8.5, "lon": 76.9, "desc": "known_point"},
-    {"lat": 8.51, "lon": 76.91, "desc": "nearby_point"},
-    {"lat": 0.0, "lon": 0.0, "desc": "invalid_point"},  # Should be outside any image
-    # Add more test points as needed
-]
 
 def log_message(message, file=None):
     """Print message to console and optionally to a file"""
     print(message)
     if file:
-        file.write(message + "\n")
+        ascii_message = message.replace('❌', '[ERROR]').replace('✅', '[OK]').replace('⚠️', '[WARNING]')
+        file.write(ascii_message + "\n")
 
-def test_coordinate(lat, lon, desc, log_file=None):
-    """Test a single lat/lon coordinate against all GeoTIFFs"""
-    log_message(f"\n=== Testing coordinate: {lat}, {lon} ({desc}) ===", log_file)
+def latlong_to_webmercator(lat, lon):
+    """
+    Convert latitude/longitude to Web Mercator (EPSG:3857) coordinates
+    This is a direct implementation to avoid PROJ database issues
+    """
+    # Constants for the Earth's radius in meters
+    EARTH_RADIUS = 6378137.0
+    
+    # Convert to radians
+    lat_rad = math.radians(lat)
+    lon_rad = math.radians(lon)
+    
+    # Calculate the x coordinate
+    x = EARTH_RADIUS * lon_rad
+    
+    # Calculate the y coordinate
+    y = EARTH_RADIUS * math.log(math.tan(math.pi/4 + lat_rad/2))
+    
+    return x, y
+
+def process_coordinate(lat, lon, desc, window_size=1000, log_file=None):
+    """Process a single lat/lon coordinate against all GeoTIFFs"""
+    log_message(f"\n=== Processing coordinate: {lat}, {lon} ({desc}) ===", log_file)
     
     found = False
     
@@ -45,135 +58,117 @@ def test_coordinate(lat, lon, desc, log_file=None):
                 # Log TIFF metadata
                 log_message(f"  CRS: {src.crs}", log_file)
                 log_message(f"  Bounds: {src.bounds}", log_file)
-                log_message(f"  Shape: {src.shape}", log_file)
                 
-                # Step 1: Transform WGS84 (lat/lon) -> image CRS
-                try:
-                    dst_crs = src.crs
-                    x, y = transform("EPSG:4326", dst_crs, [lon], [lat])
-                    x, y = x[0], y[0]
-                    log_message(f"  Transformed coordinates: {x}, {y}", log_file)
-                except Exception as e:
-                    log_message(f"  ❌ Coordinate transformation failed: {e}", log_file)
+                # Determine coordinate type and transform if needed
+                if abs(lat) <= 90 and abs(lon) <= 180:
+                    log_message(f"  Detected WGS84 geographic coordinates: lat={lat}, lon={lon}", log_file)
+                    
+                    # Convert lat/lon to Web Mercator using our custom function
+                    x, y = latlong_to_webmercator(lat, lon)
+                    log_message(f"  Transformed to Web Mercator: x={x:.2f}, y={y:.2f}", log_file)
+                else:
+                    log_message(f"  Detected projected coordinates: ({lat}, {lon})", log_file)
+                    
+                    # Check if values need to be swapped for Web Mercator
+                    if abs(lat) > abs(lon) and abs(lat) > 1000000:  # Likely swapped
+                        log_message(f"  Swapping projected coordinates", log_file)
+                        x, y = lat, lon
+                    else:
+                        x, y = lon, lat
+                        
+                    log_message(f"  Using projected coordinates: x={x}, y={y}", log_file)
+                
+                # Check if the point is within the GeoTIFF bounds
+                bounds = src.bounds
+                if not (bounds.left <= x <= bounds.right and bounds.bottom <= y <= bounds.top):
+                    log_message(f"  ❌ Point ({x:.2f}, {y:.2f}) outside image bounds", log_file)
                     continue
+                else:
+                    log_message(f"  ✅ Point ({x:.2f}, {y:.2f}) within image bounds", log_file)
                 
-                # Step 2: Check if point is within image bounds
-                try:
-                    row, col = src.index(x, y)
-                    log_message(f"  Image pixels: row={row}, col={col}", log_file)
-                except Exception as e:
-                    log_message(f"  ❌ Point outside image bounds: {e}", log_file)
-                    continue
+                # Convert to pixel coordinates
+                row, col = src.index(x, y)
+                log_message(f"  Image pixels: row={row}, col={col}", log_file)
                 
-                # Step 3: Calculate window parameters
+                # Calculate window parameters
                 h, w = src.height, src.width
-                size = 1024
-                half = size // 2
+                half = window_size // 2
                 
                 # Calculate window offset, handling edge cases
-                row_off = max(0, min(row - half, h - size))
-                col_off = max(0, min(col - half, w - size))
+                row_off = max(0, min(row - half, h - window_size))
+                col_off = max(0, min(col - half, w - window_size))
                 
                 # Check if we can get a full window
-                if row_off + size > h or col_off + size > w:
-                    log_message(f"  ⚠️ Cannot get full 1024x1024 window, edge of image", log_file)
-                    log_message(f"  Image size: {w}x{h}, Requested window: {col_off}:{col_off+size}, {row_off}:{row_off+size}", log_file)
+                if row_off + window_size > h or col_off + window_size > w:
+                    log_message(f"  ⚠️ Cannot get full {window_size}x{window_size} window, edge of image", log_file)
                     
                     # Calculate maximum possible size
-                    possible_width = min(size, w - col_off)
-                    possible_height = min(size, h - row_off)
-                    log_message(f"  Maximum possible window size: {possible_width}x{possible_height}", log_file)
+                    possible_width = min(window_size, w - col_off)
+                    possible_height = min(window_size, h - row_off)
                     
                     if possible_width < 100 or possible_height < 100:
                         log_message(f"  ❌ Window too small, skipping", log_file)
                         continue
                     
-                    # For testing purposes, continue with partial window
+                    # Use partial window
                     window = Window(col_off, row_off, possible_width, possible_height)
                     log_message(f"  ⚠️ Using partial window: {window}", log_file)
                 else:
-                    window = Window(col_off, row_off, size, size)
+                    window = Window(col_off, row_off, window_size, window_size)
                     log_message(f"  ✅ Using full window: {window}", log_file)
                 
-                # Step 4: Read window and save image
+                # Read window and save image
                 img = src.read([1, 2, 3], window=window)  # RGB channels
                 img = np.transpose(img, (1, 2, 0)).astype(np.uint8)  # HWC
                 
-                log_message(f"  Image array shape: {img.shape}", log_file)
-                log_message(f"  Image stats: min={img.min()}, max={img.max()}, mean={img.mean():.2f}", log_file)
+                # Resize to exactly 1024x1024
+                img_1024 = cv2.resize(img, (1024, 1024), interpolation=cv2.INTER_LINEAR)
+                log_message(f"  Resized from {img.shape} to {img_1024.shape}", log_file)
                 
                 # Create output filename
-                out_filename = f"{desc}_from_{fname.split('.')[0]}_{lat}_{lon}.jpg"
+                out_filename = f"{desc}_{fname.split('.')[0]}_{lat}_{lon}.jpg"
                 out_path = os.path.join(OUTPUT_DIR, out_filename)
                 
-                # Save the image
-                cv2.imwrite(out_path, cv2.cvtColor(img, cv2.COLOR_RGB2BGR))
-                log_message(f"  ✅ Saved image to: {out_path}", log_file)
+                # Save the 1024x1024 image
+                cv2.imwrite(out_path, cv2.cvtColor(img_1024, cv2.COLOR_RGB2BGR))
+                log_message(f"  ✅ Saved 1024x1024 image to: {out_path}", log_file)
                 
-                # Create a visualization with the center point marked
-                vis_img = img.copy()
-                center_y, center_x = row - row_off, col - col_off
+                # Create visualization with center point marked
+                vis_img = img_1024.copy()
+                center_y, center_x = vis_img.shape[0] // 2, vis_img.shape[1] // 2
                 
-                # Check if center is within the cropped image
-                if 0 <= center_x < vis_img.shape[1] and 0 <= center_y < vis_img.shape[0]:
-                    # Draw crosshair at the target point (red)
-                    cv2.drawMarker(vis_img, (center_x, center_y), (255, 0, 0), cv2.MARKER_CROSS, 20, 2)
-                    
-                    # Add coordinate text
-                    cv2.putText(vis_img, f"lat: {lat}, lon: {lon}", 
-                              (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
-                    
-                    # Save visualization
-                    vis_path = os.path.join(OUTPUT_DIR, f"vis_{out_filename}")
-                    cv2.imwrite(vis_path, cv2.cvtColor(vis_img, cv2.COLOR_RGB2BGR))
-                    log_message(f"  ✅ Saved visualization to: {vis_path}", log_file)
-                else:
-                    log_message(f"  ⚠️ Target point ({center_x}, {center_y}) outside cropped region", log_file)
+                # Draw crosshair at the center (red)
+                cv2.drawMarker(vis_img, (center_x, center_y), (0, 0, 255), cv2.MARKER_CROSS, 20, 2)
                 
-                # Coordinate found in this file
+                # Add coordinate info
+                cv2.putText(vis_img, f"lat: {lat}, lon: {lon}", 
+                          (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+                
+                # Save visualization
+                vis_path = os.path.join(OUTPUT_DIR, f"vis_{out_filename}")
+                cv2.imwrite(vis_path, cv2.cvtColor(vis_img, cv2.COLOR_RGB2BGR))
+                log_message(f"  ✅ Saved visualization to: {vis_path}", log_file)
+                
                 found = True
-                
-                # Test back-transformation (pixel to geo)
-                # For a point we know is in the image (the center)
-                px_center_x, px_center_y = vis_img.shape[1] // 2, vis_img.shape[0] // 2
-                
-                # Convert to source pixel coordinates
-                src_px_x = col_off + px_center_x
-                src_px_y = row_off + px_center_y
-                
-                # Get CRS coordinates
-                geo_x, geo_y = src.xy(src_px_y, src_px_x)
-                
-                # Convert back to lat/lon
-                geo_lon, geo_lat = transform(dst_crs, "EPSG:4326", [geo_x], [geo_y])
-                log_message(f"  Pixel ({px_center_x}, {px_center_y}) -> geo: ({geo_lon[0]}, {geo_lat[0]})", log_file)
+                break  # Stop after first match
                 
         except Exception as e:
             log_message(f"  ❌ Error processing file {fname}: {e}", log_file)
     
-    if not found:
-        log_message(f"❌ Coordinate {lat}, {lon} ({desc}) not found in any image", log_file)
-    else:
-        log_message(f"✅ Coordinate {lat}, {lon} ({desc}) successfully processed", log_file)
-    
     return found
 
 def main():
-    # Set up argument parser
-    parser = argparse.ArgumentParser(description='Test GeoTIFF access and cropping')
-    parser.add_argument('--add-coord', nargs=3, metavar=('LAT', 'LON', 'DESC'), 
-                        help='Add a test coordinate: latitude longitude description')
+    parser = argparse.ArgumentParser(description='Extract GeoTIFF crop at geographic coordinates')
+    parser.add_argument('lat', type=float, help='Latitude (WGS84)')
+    parser.add_argument('lon', type=float, help='Longitude (WGS84)')
+    parser.add_argument('--desc', type=str, default='location', help='Description for the output files')
+    parser.add_argument('--size', type=int, default=1000, help='Window size in pixels')
     args = parser.parse_args()
     
-    # Add any command line coordinates to the test set
-    if args.add_coord:
-        lat, lon, desc = args.add_coord
-        TEST_COORDINATES.append({"lat": float(lat), "lon": float(lon), "desc": desc})
-    
     # Open log file
-    log_path = os.path.join(OUTPUT_DIR, f"tiff_test_log_{int(time.time())}.txt")
-    with open(log_path, 'w') as log_file:
-        log_message(f"GeoTIFF Access Test - {time.ctime()}", log_file)
+    log_path = os.path.join(OUTPUT_DIR, f"process_log_{int(time.time())}.txt")
+    with open(log_path, 'w', encoding='utf-8') as log_file:
+        log_message(f"GeoTIFF Processing - {time.ctime()}", log_file)
         log_message(f"TIFF directory: {os.path.abspath(TIFF_DIR)}", log_file)
         log_message(f"Output directory: {os.path.abspath(OUTPUT_DIR)}", log_file)
         
@@ -181,19 +176,16 @@ def main():
         tiff_files = [f for f in os.listdir(TIFF_DIR) if f.endswith('.tif')]
         log_message(f"Found {len(tiff_files)} TIFF files: {tiff_files}", log_file)
         
-        # Process each test coordinate
-        results = []
-        for coord in TEST_COORDINATES:
-            result = test_coordinate(coord["lat"], coord["lon"], coord["desc"], log_file)
-            results.append((coord, result))
+        # Process coordinate
+        success = process_coordinate(args.lat, args.lon, args.desc, args.size, log_file)
         
-        # Summary
-        log_message("\n=== SUMMARY ===", log_file)
-        for (coord, result) in results:
-            status = "✅ Found" if result else "❌ Not found"
-            log_message(f"{status}: {coord['lat']}, {coord['lon']} ({coord['desc']})", log_file)
+        # Report result
+        if success:
+            log_message(f"✅ Successfully processed coordinate: {args.lat}, {args.lon}", log_file)
+        else:
+            log_message(f"❌ Failed to process coordinate: {args.lat}, {args.lon}", log_file)
         
-        log_message(f"\nLog saved to: {log_path}")
+        log_message(f"Log saved to: {log_path}")
 
 if __name__ == "__main__":
     main()
