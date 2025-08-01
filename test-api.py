@@ -1,4 +1,5 @@
 from flask import Flask, request, jsonify
+from flask_cors import CORS
 import os, cv2, torch
 import numpy as np
 import rasterio
@@ -13,6 +14,7 @@ import sys
 import datetime
 
 app = Flask(__name__)
+CORS(app)  # Add this line to enable CORS for all routes
 
 # Path to directory containing all Panchayat-level GeoTIFFs
 TIFF_DIR = "./TKM_Images"
@@ -515,8 +517,9 @@ def infer_coord():
                             lon, lat = webmercator_to_wgs84(geo_x, geo_y)
                             return lon, lat  # Already in longitude, latitude order
             
-            # Generate GeoJSON features
-            link_count = 0
+            # Generate GeoJSON features with MultiLineString format
+            road_segments = {}  # Dictionary to collect line segments
+            
             for i in range(64):
                 for j in range(64):
                     if prob[0, i, j] == 1:
@@ -528,6 +531,7 @@ def infer_coord():
                             
                         geo_x1, geo_y1 = pixel_to_geo(x1, y1)
                         
+                        # Process each direction
                         for d, (di, dj) in enumerate(dirs):
                             ni, nj = i+di, j+dj
                             if 0 <= ni < 64 and 0 <= nj < 64 and link_processed[d, i, j] == 1:
@@ -539,22 +543,73 @@ def infer_coord():
                                     
                                 geo_x2, geo_y2 = pixel_to_geo(x2, y2)
                                 
-                                features.append({
-                                    "type": "Feature",
-                                    "geometry": {
-                                        "type": "LineString", 
-                                        "coordinates": [[geo_x1, geo_y1], [geo_x2, geo_y2]]
-                                    },
-                                    "properties": {
-                                        "cell": [i, j], 
-                                        "dir": d,
-                                        "direction_name": ["N", "NE", "E", "SE", "S", "SW", "W", "NW"][d]
-                                    }
-                                })
-                                link_count += 1
+                                # Create a unique road ID (using i,j as road identifier)
+                                road_id = f"road_{i}_{j}"
+                                
+                                # Add segment to road collection
+                                if road_id not in road_segments:
+                                    road_segments[road_id] = []
+                                
+                                # Add the coordinates with z-value (0.0) for compatibility
+                                road_segments[road_id].append([
+                                    [geo_x1, geo_y1, 0.0],
+                                    [geo_x2, geo_y2, 0.0]
+                                ])
+            
+            # Convert segments to MultiLineString features
+            features = []
+            for idx, (road_id, segments) in enumerate(road_segments.items()):
+                features.append({
+                    "type": "Feature",
+                    "properties": {
+                        "OBJECTID_1": idx + 1,
+                        "id": None,
+                        "lsgdcode": "G020303",
+                        "munci": None,
+                        "panch": "Melila",
+                        "block": "Vettikkavala",
+                        "localbody": "Grama Panchayat",
+                        "roadname": f"DETECTED_ROAD_{idx+1}",
+                        "roadid": f"AUTO-{idx+1:06d}",
+                        "district": "Kollam",
+                        "roadcode": None,
+                        "category": "VR",
+                        "surfacetyp": "Concrete",
+                        "roadtype": "AWR",
+                        "width": "3",
+                        "carriagewa": "3",
+                        "formationw": "3",
+                        "soiltype": "Laterite",
+                        "terraintyp": "Plain",
+                        "roadlength": 0.0,  # Could calculate actual length
+                        "year_maint": None,
+                        "junction_n": None,
+                        "junction_l": "/",
+                        "junction_r": None,
+                        "junction_j": None,
+                        "road_start": "-",
+                        "road_locn_": f"{lat}/{lon}",
+                        "road_remar": ":/:/:/:",
+                        "layer": None,
+                        "path": None,
+                        "StartChain": 0.0,
+                        "EndChain": 0.0,
+                        "Grid": 0.0,
+                        "external_s": "0",
+                        "Corporatio": None,
+                        "ownership": None,
+                        "OBJECTID": 0,
+                        "Shape_Leng": 0.0,
+                        "Shape_Le_1": 0.0
+                    },
+                    "geometry": {
+                        "type": "MultiLineString",
+                        "coordinates": segments
+                    }
+                })
             
             debug_info["feature_count"] = len(features)
-            debug_info["link_count"] = link_count
+            debug_info["link_count"] = sum(len(segments) for segments in road_segments.values())
             
             process_time = time.time() - start_time
             debug_info["processing_steps"].append(f"Total processing time: {process_time:.2f}s")
